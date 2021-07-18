@@ -406,4 +406,4 @@ rmse_outputs %>% knitr::kable()
 
 ## Conclusion
 
-A naive approach have been implemented together with the movie effect and user- movie effect   taken as second and third models respectively. Furthermore, the regularization and an alternative matrix factorization were considered as fourth and fifth models respectively, and the lowest RMSE of 0.7808 was derived using the fifth and final validation data set.
+A naive approach has been implemented together with the movie effect and user-movie effect taken as second and third models respectively. Furthermore, the regularization and an alternative matrix factorization were considered as fourth and fifth models respectively, and the lowest RMSE of 0.7805 was derived using the fifth and final validation data set.
