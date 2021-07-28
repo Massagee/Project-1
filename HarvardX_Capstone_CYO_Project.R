@@ -1,0 +1,441 @@
+# Installing required packages.
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(recosystem)) install.packages("recosystem", repos = "http://cran.us.r-project.org")
+if(!require(ggthemes)) install.packages("ggthemes", repos = "http://cran.us.r-project.org")
+if(!require(scales)) install.packages("scales", repos = "http://cran.us.r-project.org")
+
+# Loading required library
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(recosystem)
+library(knitr)
+library(ggthemes)
+library(scales)
+library(lubridate)
+library(tinytex)
+library(rmarkdown)
+library(Matrix)
+library(recommenderlab)
+library(kableExtra)
+library(readr)
+
+# loading data
+
+book_ratings <- read.csv("https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/ratings.csv", 
+                         sep = ",", header = T, stringsAsFactors = F)
+book_titles <- read.csv("https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/books.csv", 
+                        sep = ",", header = T, stringsAsFactors = F) %>% select(book_id, title)
+ratings <- book_ratings
+books <- book_titles
+
+# tables dimensions
+
+dim(books)
+head(books)
+dim(ratings)
+head(ratings)
+
+# The GoodBooks Rating > 5M dataset:
+# https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/ratings.csv
+
+bookcrossing <- left_join(ratings, books, by = "book_id")
+
+# I'm using later version of r; so, i will set seed as follow.
+
+set.seed(1, sample.kind="Rounding") 
+
+# Creating a validation set. Validation set will be 10% of MovieLens data.
+
+test_index <- createDataPartition(y = bookcrossing$rating, times = 1, p = 0.1, list = FALSE)
+cyo <- bookcrossing[-test_index,]
+temp <- bookcrossing[test_index,]
+
+# Make sure user_id and book_id in validation set are also in edx set
+
+validation <- temp %>% 
+  semi_join(cyo, by = "user_id") %>%
+  semi_join(cyo, by = "book_id")
+
+# Add rows removed from validation set back into edx set
+
+removed <- anti_join(temp, validation)
+cyo <- rbind(cyo, removed)
+
+rm(test_index, ratings, bookcrossing, temp, removed)
+
+# Partitioning the data set into a train_set and a test_set
+
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = cyo$rating, times = 1, p = 0.2, list = FALSE)
+train_set <- cyo[-test_index,]
+temp <- cyo[test_index,]
+
+# Matching user_id and book_id in both train and test sets
+
+test_set <- temp %>%
+  semi_join(train_set, by = "user_id") %>%
+  semi_join(train_set, by = "book_id")
+
+# Adding back rows into train set
+
+removed <- anti_join(temp, test_set)
+train_set <- rbind(train_set, removed)
+
+rm(test_index, temp, removed)
+
+# Data Exploratory Anaysis
+
+# Number of rows and columns in the cyo dataset?
+
+nrow(cyo)
+ncol(cyo)
+head(cyo)
+
+# Number of zeros given as ratings in the cyo dataset?  
+
+cyo %>% filter(rating == 0) %>% tally()
+
+# Average rating for the cyo is ~ 4 (i.e. 3.919887) Let's see the number of threes and foursgiven as ratings. 
+
+mean(cyo$rating)
+cyo %>% filter(rating == 3) %>% tally()
+cyo %>% filter(rating == 4) %>% tally()
+
+# Different books in the cyo dataset.
+
+n_distinct(cyo$book_id)
+
+# Different titles in the cyo dataset.
+
+n_distinct(cyo$title)
+
+# Different users in the cyo data set?
+
+n_distinct(cyo$user_id)
+
+# Different rating in the cyo data set?
+
+n_distinct(cyo$rating)
+
+# Detecting the structure of the cyo data set.
+
+cyo %>% group_by(book_id) %>% 
+  summarise(n=n()) %>%
+  head()
+cyo %>% group_by(title) %>% 
+  summarise(n=n()) %>%
+  head()
+
+# books in ascending order
+
+tibble(count = str_count(cyo$title, fixed("|")), title = cyo$title) %>% 
+  group_by(count, title) %>%
+  summarise(n = n()) %>%
+  arrange(count) %>% 
+  head()
+
+# In general, half star ratings are less common than whole star ratings 
+
+cyo %>%
+  group_by(rating) %>%
+  summarize(count = n()) %>%
+  ggplot(aes(x = rating, y = count)) +
+  geom_line()
+
+# Movie with the greatest number of ratings?
+
+cyo %>% group_by(book_id, title) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count))
+
+# The ten most given ratings in order from most to least?
+
+cyo %>% group_by(rating) %>% summarize(count = n()) %>% top_n(10) %>%
+  arrange(desc(count))
+
+## Method and Evaluation
+
+# Define Mean Absolute Error (MAE)
+#The mean absolute error is the average of absolute differences between the predicted value and the true 
+# value. The metric is linear, which means that all errors are equally weighted. Thus, when predicting 
+#ratings in a scale of 1 to 5, the MAE assumes that an error of 2 is twice as bad as an error of 1.
+
+MAE <- function(true_ratings, predicted_ratings){
+  mean(abs(true_ratings - predicted_ratings))
+}
+
+# Define Root Mean Squared Error (RMSE)
+# The Root Mean Squared Error, RMSE, is the square root of the MSE, which is not consider here. It is the 
+# typical metric to evaluate recommendation systems, and is defined by the formula:
+
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+
+# Building Model
+
+# Model 1: Just the average of the data set for all books and users, 
+# The simplest model assumes a random distribution of error from book to book variations, when predicting that
+# all users will rate all books the same.Considering statistics theory, the mean, which is just the average of 
+# all observed ratings, minimizes the RMSE, as described in the formula below.
+#    Ŷ u,i=μ+ϵi,u
+
+mu <- mean(train_set$rating)
+rmse1 <- RMSE(test_set$rating, mu)
+
+# Let's see how prediction is at this moment by replicating the x value at 2 and halt times of the 
+# test set up to maximum and counting the number of rows in the predicted test 
+# set and then predicting the RMSE of its rating.
+
+predictions <- rep(2.5, nrow(test_set))
+RMSE(test_set$rating, predictions)
+
+# creating a table to store the rmse results for every model's result along the way.
+# 6 significant digits
+
+options(digits = 6)
+
+naive_rmse <- RMSE(test_set$rating, mu)
+
+results <- tibble(Method = "Mean", RMSE = naive_rmse, MAE = naive_rmse)
+results
+
+# Model 2: the book effect on ratings
+# From exploratory data analysis, it was observed that some books are more popular than others and receive 
+# higher ratings. Considering the book effect, this model will be improved by adding the term bi to the 
+# formula used to determine the average of all books like this;
+# Yu,i = μ + bi + ϵu,i
+
+bi <- train_set %>%
+  group_by(book_id) %>%
+  summarize(b_i = mean(rating - mu))
+
+# Visual description of the book effect
+
+bi %>% ggplot(aes(b_i)) +
+  geom_histogram(color = "pink", fill = "darkgrey", bins = 12) +
+  xlab("Book Effect") +
+  ylab("Count") +
+  theme_bw()
+
+# Normal distribution for the book effect
+
+bi %>% ggplot(aes(x = b_i)) + 
+  geom_histogram(bins=12, col = I("yellow")) +
+  ggtitle("Distribution of the Book Effect") +
+  xlab("Book effect") +
+  ylab("Count") +
+  scale_y_continuous(labels = comma) + 
+  theme_economist()
+
+# Predicting the rmse of the book effect on the test set considering the mean as well and then using left_join 
+# to return all row column by book_id. 
+
+predicted_ratings <- mu + test_set %>%
+  left_join(bi, by = "book_id") %>%
+  .$b_i
+book_effect_rmse <- RMSE(predicted_ratings, test_set$rating)
+results <- bind_rows(results, tibble(Method = "The Book Effect", RMSE = book_effect_rmse, 
+                                          MAE = book_effect_rmse))
+results
+
+# Model 3: the user's specific effect on ratings.
+# Considering the user's effect, this model can be improved by adding the term "bu" to the formula used in 
+# previous model like this;
+# Yu,i = μ + bi + bu + ϵu,i
+# Here the user effect model is built on the train_set by returning all rows and columns from the book effect
+# by bookid and then taking the mean of the rating excluding the overall average and the book effect
+
+bu <- train_set %>%
+  left_join(bi, by = "book_id") %>%
+  group_by(user_id) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+# Normal distribution for the user effect
+
+train_set %>% 
+  group_by(user_id) %>% 
+  summarize(b_u = mean(rating)) %>% 
+  filter(n()>=100) %>%
+  ggplot(aes(b_u)) + 
+  geom_histogram(color = "yellow") + 
+  ggtitle("Normal Distribution of the User Effect") +
+  xlab("Bias for User") +
+  ylab("Count") +
+  scale_y_continuous(labels = comma) + 
+  theme_economist()
+
+# plotting the book and user matrix
+
+users <- sample(unique(cyo$user_id), 100)
+cyo %>% filter(user_id %in% users) %>%
+  select(user_id, book_id, rating) %>%
+  mutate(rating = 1) %>%
+  spread(book_id, rating) %>% 
+  select(sample(ncol(.), 100)) %>% 
+  as.matrix() %>% t(.) %>%
+  image(1:100, 1:100,. , xlab="Number of Books", ylab="Users") %>%
+  abline(h=0:100+0.5, v=0:100+0.5, col = "gold") %>%
+  title("Matrix: Books & Uers")
+
+# Predicting the rmse of the user effect
+
+predicted_ratings <- test_set %>%
+  left_join(bi, by = "book_id") %>%
+  left_join(bu, by = "user_id") %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+user_effect_rmse <- RMSE(predicted_ratings, test_set$rating)
+results <- bind_rows(results, tibble(Method = "The Book & User Effect", RMSE = user_effect_rmse, 
+                                     MAE = user_effect_rmse))
+results
+
+# different book titles
+
+titles <- train_set %>% 
+  select(book_id, title) %>% 
+  distinct()
+
+# Best unknown books rated by b_i
+
+bi %>% 
+  inner_join(titles, by = "book_id") %>% 
+  arrange(-b_i) %>% 
+  select(title) %>%
+  head()
+
+# Worst unknown books rated by b_i
+
+bi %>% 
+  inner_join(titles, by = "book_id") %>% 
+  arrange(b_i) %>% 
+  select(title) %>%
+  head()
+
+# Number of ratings for 10 best movies:
+  
+train_set %>% 
+  left_join(bi, by = "book_id") %>%
+  arrange(desc(b_i)) %>% 
+  group_by(title) %>% 
+  summarise(n = n()) %>% 
+  slice(1:10)
+
+train_set %>% count(book_id) %>% 
+  left_join(bi, by="book_id") %>% 
+  arrange(desc(b_i)) %>% 
+  slice(1:10) %>% 
+  pull(n)
+
+# Model 4: regularizing the book and user effects on rating using the best parameters from lanbdas to penalize 
+# or reduce noisy data. Here,three sets of lambdas are defined to tune lambdas beforehand.
+
+lambdas <- seq(0, 10, 0.25)
+rmses <- sapply(lambdas, function(x){
+  b_i <- train_set %>%
+    group_by(book_id) %>%
+    summarize(b_i = sum(rating - mu)/(n()+x))
+  b_u <- train_set %>%
+    left_join(b_i, by = "book_id") %>%
+    group_by(user_id) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+x))
+  predicted_ratings <- test_set %>%
+    left_join(b_i, by = "book_id") %>%
+    left_join(b_u, by = "user_id") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    .$pred
+  return(RMSE(predicted_ratings, test_set$rating))
+})
+
+# plotting lambdas vs. RMSE
+
+qplot(lambdas, rmses, color = I("blue"))
+
+# Picking lambdas with the lowest RMSE to be used for regularizing the book and user effects.
+
+lamb <- lambdas[which.min(rmses)]
+lamb
+
+# Predicting the rmse from a regularized book and user effects
+
+mu <- mean(train_set$rating)
+
+b_i <- train_set %>% 
+  group_by(book_id) %>%
+  summarize(b_i = sum(rating - mu)/(n()+lamb))
+
+b_u <- train_set %>% 
+  left_join(b_i, by="book_id") %>%
+  group_by(user_id) %>%
+  summarize(b_u = sum(rating - b_i - mu)/(n()+lamb))
+
+# Prediction
+
+mu_reg <- test_set %>% 
+  left_join(b_i, by = "book_id") %>%
+  left_join(b_u, by = "user_id") %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+# Update the result table
+results <- bind_rows(results, 
+                    tibble(Method = "Regularization: The Book & User Effects", 
+                           RMSE = RMSE(test_set$rating, mu_reg),
+                           MAE  = MAE(test_set$rating, mu_reg)))
+results
+
+# Model 5: matrix factorization - alternatively using the recosystem for tuning due to memory gap.
+# Matrix Factorization - the alternative Recosystem will be used instead due to the memory gap on commercial 
+# computer currently in use. Here, the best tuning parameters is used from an R suggested class object called 
+# Reco(). The train() method allows for a set of parameters inside the function and then, the $predict() is used 
+# for predicted values.
+
+set.seed(1, sample.kind="Rounding")
+train_reco <- with(train_set, data_memory(user_index = user_id, item_index = book_id, rating = rating))
+test_reco <- with(test_set, data_memory(user_index = user_id, item_index = book_id, rating = rating))
+rec <- Reco()
+
+alt_reco <- rec$tune(train_reco, opts = list(dim = c(20, 30),
+                                             lrate = c(0.01, 0.1),
+                                             costp_l1 = c(0.01, 0.1),
+                                             costq_l1 = c(0.01, 0.1),
+                                             nthread = 4,
+                                             niter = 10))
+
+rec$train(train_reco, opts = c(alt_reco$min, nthread = 4, niter = 40))
+results_alt_reco <- rec$predict(test_reco, out_memory())
+
+mat_factor_rmse <- RMSE(results_alt_reco, test_set$rating)
+results <- bind_rows(results, tibble(Method = "Matrix factorization - the recosystem", 
+                                     RMSE = mat_factor_rmse, MAE = mat_factor_rmse))
+results
+
+# Finalizing rmse prediction on the validation set. The lowest thus far, has been obtained on the fourth of 
+# four models using matrix factorization with the recosystem. Finally, the cyo data set will be used to train 
+# result fromm the fourth model, while the validation set will be used to test for accuracy.
+
+set.seed(1, sample.kind="Rounding")
+cyo_reco_sys <- with(cyo, data_memory(user_index = user_id, item_index = book_id, rating = rating))
+valid_reco <- with(validation, data_memory(user_index = user_id, item_index = book_id, rating = rating))
+rec <- Reco()
+
+alt_reco <- rec$tune(cyo_reco_sys, opts = list(dim = c(20, 30),
+                                               lrate = c(0.01, 0.1),
+                                               costp_l2 = c(0.01, 0.1),
+                                               costq_l2 = c(0.01, 0.1),
+                                               nthread = 4,
+                                               niter = 10))
+
+rec$train(cyo_reco_sys, opts = c(alt_reco$min, nthread = 4, niter = 40))
+
+valid_reco <- rec$predict(valid_reco, out_memory())
+
+valid_final_rmse <- RMSE(valid_reco, validation$rating)
+results <- bind_rows(results, tibble(Method = "Final validation: Matrix factorization - the recosystem", 
+                                     RMSE = valid_final_rmse, MAE = valid_final_rmse))
+results
